@@ -1,0 +1,216 @@
+import math
+import random
+from vexcode_vr import *
+
+# Robot hardware configuration
+brain = Brain()
+drivetrain = Drivetrain("drivetrain", 0)
+pen = Pen("pen", 8)
+pen.set_pen_width(THIN)
+
+left_bumper = Bumper("leftBumper", 2)
+right_bumper = Bumper("rightBumper", 3)
+front_eye = EyeSensor("frontEye", 4)
+down_eye = EyeSensor("downEye", 5)
+front_distance = Distance("frontdistance", 6)
+distance = front_distance
+magnet = Electromagnet("magnet", 7)
+location = Location("location", 9)
+
+drivetrain.set_drive_velocity(100, PERCENT)
+drivetrain.set_turn_velocity(100, PERCENT)
+
+CELL_SIZE = 250  # Each cell is 250mm x 250mm
+THRESHOLD = 260  # Distance sensor threshold for detecting walls
+
+def navigation_phase():
+    """
+    Navigate the maze until the red marker (exit) is detected.
+    Returns:
+      exitCoords: The coordinate where the red marker is detected.
+      pathList: The list of coordinates representing the traveled path.
+    """
+    coordinates = [0, 0]
+    pathList = [coordinates.copy()]
+    exitCoords = None
+    returning = False
+
+    while True:
+        # Check for maze exit.
+        if down_eye.detect(RED):
+            exitCoords = coordinates.copy()
+            break
+
+        # Follow the left wall.
+        drivetrain.turn_for(LEFT, 90, DEGREES)
+        while front_eye.near_object():
+            drivetrain.turn_for(RIGHT, 90, DEGREES)
+
+        # Compute the next coordinate only once.
+        next_coord = newCoordinates(coordinates)
+        if next_coord not in pathList and returning:
+            pathList.append(coordinates.copy())
+            returning = False
+
+        drivetrain.drive_for(FORWARD, CELL_SIZE, MM)
+        if next_coord in pathList:
+            pathList = pathList[:pathList.index(next_coord)]
+            returning = True
+        else:
+            pathList.append(next_coord.copy())
+
+        coordinates = next_coord.copy()
+
+    return exitCoords, pathList
+
+def returning_home_phase(exitCoords, pathList):
+    """
+    Retrace the saved path from the exit back to home while drawing the path.
+    """
+    brain.print("End Found!\n")
+    brain.print("Returning Home...\n")
+    pen.set_pen_color(RED)
+    pen.move(DOWN)  # Lower pen to draw
+
+    # Use a copy of the path and remove the exit coordinate.
+    return_array = pathList.copy()
+    if return_array:
+        return_array.pop()
+
+    coords = exitCoords.copy()
+    while return_array:
+        wait(5, MSEC)
+        # Pop the last coordinate (more efficient than indexing then popping)
+        nextCoord = return_array.pop()
+        axis = 0 if coords[0] != nextCoord[0] else 1
+        heading = 270 - (axis * 90) if coords[axis] > nextCoord[axis] else 90 - (axis * 90)
+        drivetrain.turn_to_heading(heading, DEGREES)
+        drivetrain.drive_for(FORWARD, CELL_SIZE, MM)
+        coords = nextCoord.copy()
+
+    pen.move(UP)
+    brain.print("Arrived home!\n")
+    return coords
+
+def mapping_phase(exitCoords):
+    """
+    Explore the maze from home to map the walls.
+    Returns:
+      mappingArray: A 2D grid containing each cell's data.
+      keyNum: The dimension (number of cells per side) of the grid.
+    """
+    brain.print("Mapping Beginning...\n")
+    # Compute equaliser using a ternary operator.
+    equaliser = int((exitCoords[1] / 2) + 1) if exitCoords[1] % 2 == 0 else int((exitCoords[1] + 1) / 2)
+    
+    # Determine available routes from home by checking three directions.
+    routes = 0
+    drivetrain.turn_to_heading(270, DEGREES)
+    for _ in range(3):
+        if not front_eye.near_object():
+            routes += 1
+        drivetrain.turn_for(RIGHT, 90, DEGREES)
+    drivetrain.turn_for(LEFT, 90, DEGREES)
+
+    keyNum = exitCoords[1] + 1
+    # Initialize mappingArray as a keyNum x keyNum grid using a list comprehension.
+    mappingArray = [[[0, 0, 0, 0] for _ in range(keyNum)] for _ in range(keyNum)]
+    visitedArray = []
+    coords = [0, 0]
+
+    while routes > 0:
+        if coords not in visitedArray:
+            visitedArray.append(coords.copy())
+            saveAngle = location.position_angle(DEGREES)
+            # Check for walls in two directions.
+            drivetrain.turn_to_heading(0, DEGREES)
+            upWall = 1 if front_eye.near_object() else 0
+            drivetrain.turn_for(RIGHT, 90, DEGREES)
+            rightWall = 1 if front_eye.near_object() else 0
+            mappingArray[coords[1]][coords[0] + equaliser] = [coords[0], coords[1], upWall, rightWall]
+            drivetrain.turn_to_heading(saveAngle, DEGREES)
+
+        # Follow the right wall with boundary checks.
+        drivetrain.turn_for(RIGHT, 90, DEGREES)
+        while True:
+            current_angle = location.position_angle(DEGREES)
+            if (front_eye.near_object() or 
+               (coords[1] == exitCoords[1] and current_angle in [0, 360]) or 
+               (coords[1] == 0 and current_angle == 180)):
+                drivetrain.turn_for(LEFT, 90, DEGREES)
+            else:
+                break
+
+        drivetrain.drive_for(FORWARD, CELL_SIZE, MM)
+        coords = newCoordinates(coords)
+        if coords == [0, 0]:
+            routes -= 1
+
+    return mappingArray, keyNum
+
+def plot_maze(mappingArray, keyNum, exitCoords, pathList):
+    """
+    Build and print a text-based representation of the maze.
+    """
+    corner, vertWall, horWall = "+", "|", "---"
+    emptyHor, emptyVert = "   ", " "
+    endMarker, startMarker = " E ", " S "
+    plottedMap = []
+
+    for x in range(keyNum + 1):
+        if x == 0:
+            # Build top boundary using join for efficiency.
+            wallLine = "".join([corner + horWall for _ in range(keyNum)]) + corner
+            plottedMap.append(wallLine)
+        else:
+            driveLine = vertWall
+            wallLine = corner
+            for y in range(keyNum):
+                current = mappingArray[x - 1][y]
+                currentCoords = [current[0], current[1]]
+                if currentCoords == [0, 0]:
+                    cell_marker = startMarker
+                elif currentCoords == exitCoords:
+                    cell_marker = endMarker
+                elif currentCoords in pathList:
+                    cell_marker = " ● "  # Marker for path cells
+                else:
+                    cell_marker = emptyHor
+
+                driveLine += cell_marker
+                wallLine += horWall if current[2] == 1 else emptyHor
+                driveLine += vertWall if current[3] == 1 else emptyVert
+                wallLine += corner
+            plottedMap.append(driveLine)
+            plottedMap.append(wallLine)
+
+    # Print the maze map from bottom to top.
+    for line in reversed(plottedMap):
+        brain.print(line + "\n")
+
+def newCoordinates(coo):
+    """
+    Compute and return the next coordinate based on the current coordinate and robot heading.
+    """
+    angle = location.position_angle(DEGREES)
+    if angle in (0, 360):
+        return [coo[0], coo[1] + 1]
+    elif angle == 90:
+        return [coo[0] + 1, coo[1]]
+    elif angle == 180:
+        return [coo[0], coo[1] - 1]
+    else:
+        return [coo[0] - 1, coo[1]]
+
+def main():
+    """
+    Clear the screen and run each phase in sequence.
+    """
+    brain.clear()
+    exitCoords, pathList = navigation_phase()
+    returning_home_phase(exitCoords, pathList)
+    mappingArray, keyNum = mapping_phase(exitCoords)
+    plot_maze(mappingArray, keyNum, exitCoords, pathList)
+
+# Start the main function on a separate thread for VR simulation.
+vr_thread(main)
